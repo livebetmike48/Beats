@@ -14,6 +14,7 @@ CATEGORIES = {
             "mri", "surgery", "hamstring", "oblique", "elbow", "shoulder", "forearm",
             "day-to-day", "day to day", "scratched", "left the game", "exited the game",
             "tightness", "soreness", "strain", "sprain", "tommy john",
+            "injury", "injured",
         ],
     },
     "pitch_limit": {
@@ -25,6 +26,13 @@ CATEGORIES = {
             "pushed back", "extra rest", "limited to",
         ],
     },
+    "bullpen": {
+        "emoji": "🔥",
+        "label": "Bullpen",
+        "keywords": [
+            "bullpen", "piggyback", "piggy back",
+        ],
+    },
     "lineup": {
         "emoji": "📋",
         "label": "Lineup Move",
@@ -32,6 +40,7 @@ CATEGORIES = {
             "starting lineup", "batting order", "out of the lineup", "day off",
             "leadoff", "batting cleanup", "will start tonight", "starting tonight",
             "not in the lineup", "getting the night off", "sitting tonight",
+            "on deck", "pinch hit", "pinch-hit",
         ],
     },
     "roster": {
