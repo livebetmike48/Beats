@@ -25,21 +25,31 @@ log = logging.getLogger("twitter_bot")
 intents = discord.Intents.default()
 
 
-def build_tweet_embed(tweet: dict, matches: list[dict]) -> discord.Embed:
-    labels = " ".join(f"{m['emoji']} {m['label']}" for m in matches)
-    author = tweet.get("author", {})
+def build_tweet_embed(tweet: dict, matches: list[dict] = None) -> discord.Embed:
+    labels = " ".join(f"{m['emoji']} {m['label']}" for m in matches) if matches else None
+    author = tweet.get("author") or {}
+
+    tweet_dt = None
+    created_at = tweet.get("createdAt")
+    if created_at:
+        try:
+            tweet_dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
+        except Exception:
+            tweet_dt = datetime.now(timezone.utc)
+
     embed = discord.Embed(
-        title=labels or "New Tweet",
         description=tweet.get("text", ""),
-        url=tweet.get("url"),
+        url=tweet.get("twitterUrl") or tweet.get("url"),
         color=discord.Color.blue(),
-        timestamp=datetime.now(timezone.utc),
+        timestamp=tweet_dt or datetime.now(timezone.utc),
     )
     embed.set_author(
-        name=f"@{author.get('userName', 'unknown')}",
+        name=f"{author.get('name', 'Unknown')} (@{author.get('userName', 'unknown')})",
         icon_url=author.get("profilePicture"),
+        url=tweet.get("twitterUrl") or tweet.get("url"),
     )
-    embed.set_footer(text="Beat Reporter Monitor")
+    if labels:
+        embed.title = labels
     return embed
 
 
@@ -81,24 +91,25 @@ class TwitterMonitorBot(discord.Client):
         await interaction.response.defer()
         import requests
 
-        # Trying the most likely endpoint name based on TwitterAPI.io's
-        # naming pattern -- not yet verified against a live response. If
-        # this 404s, the raw response will tell us the real path to use.
         url = "https://api.twitterapi.io/twitter/list/tweets"
         headers = {"X-API-Key": TWITTERAPI_KEY}
         params = {"listId": LIST_ID}
 
         try:
             resp = await asyncio.to_thread(requests.get, url, headers=headers, params=params, timeout=15)
-            status = resp.status_code
-            body_preview = resp.text[:1200]
+            data = resp.json()
         except Exception as e:
-            await interaction.followup.send(f"Request failed entirely: {e}")
+            await interaction.followup.send(f"Request failed: {e}")
             return
 
-        await interaction.followup.send(
-            f"**TwitterAPI.io diagnostic**\n\nURL: `{url}`\nStatus: `{status}`\n\n```{body_preview}```"[:2000]
-        )
+        tweets = data.get("tweets", [])
+        if not tweets:
+            await interaction.followup.send(f"Status {resp.status_code}, but no tweets in response:\n```{resp.text[:1500]}```")
+            return
+
+        await interaction.followup.send(f"Showing the {min(3, len(tweets))} most recent tweets from your list, in the actual clean format:")
+        for tweet in tweets[:3]:
+            await interaction.channel.send(embed=build_tweet_embed(tweet))
 
     async def on_ready(self):
         log.info("Logged in as %s", self.user)
