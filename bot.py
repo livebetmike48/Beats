@@ -12,8 +12,10 @@ import storage
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-TWITTERAPI_KEY = os.getenv("TWITTERAPI_KEY")
+X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
 LIST_ID = os.getenv("LIST_ID")  # the X List ID containing all monitored beat reporters
+
+X_API_BASE = "https://api.x.com/2"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("twitter_bot")
@@ -21,28 +23,60 @@ log = logging.getLogger("twitter_bot")
 intents = discord.Intents.default()
 
 
-def build_tweet_embed(tweet: dict, matches: list[dict] = None) -> discord.Embed:
+def _fetch_list_tweets(list_id: str, max_results: int = 20) -> dict:
+    """
+    Hits the official X API v2 List Tweets endpoint. Returns the raw
+    parsed JSON response (with 'data' = tweets, 'includes' = expanded
+    user objects). Raises via requests if the HTTP call itself fails;
+    callers should still check for an 'errors' key in the response body,
+    since X API v2 can return HTTP 200 with partial errors.
+    """
+    import requests
+
+    url = f"{X_API_BASE}/lists/{list_id}/tweets"
+    headers = {"Authorization": f"Bearer {X_BEARER_TOKEN}"}
+    params = {
+        "max_results": max_results,
+        "tweet.fields": "created_at,author_id",
+        "expansions": "author_id",
+        "user.fields": "name,username,profile_image_url",
+    }
+    resp = requests.get(url, headers=headers, params=params, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _index_users(payload: dict) -> dict:
+    """Maps author_id -> user object from the 'includes.users' expansion."""
+    users = (payload.get("includes") or {}).get("users") or []
+    return {u["id"]: u for u in users}
+
+
+def build_tweet_embed(tweet: dict, users_by_id: dict, matches: list[dict] = None) -> discord.Embed:
     labels = " ".join(f"{m['emoji']} {m['label']}" for m in matches) if matches else None
-    author = tweet.get("author") or {}
+    author = users_by_id.get(tweet.get("author_id"), {})
+    username = author.get("username", "unknown")
+    tweet_id = tweet.get("id")
+    tweet_url = f"https://x.com/{username}/status/{tweet_id}" if tweet_id else None
 
     tweet_dt = None
-    created_at = tweet.get("createdAt")
+    created_at = tweet.get("created_at")  # ISO 8601, e.g. 2026-07-18T20:13:00.000Z
     if created_at:
         try:
-            tweet_dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
+            tweet_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
         except Exception:
             tweet_dt = datetime.now(timezone.utc)
 
     embed = discord.Embed(
         description=tweet.get("text", ""),
-        url=tweet.get("twitterUrl") or tweet.get("url"),
+        url=tweet_url,
         color=discord.Color.blue(),
         timestamp=tweet_dt or datetime.now(timezone.utc),
     )
     embed.set_author(
-        name=f"{author.get('name', 'Unknown')} (@{author.get('userName', 'unknown')})",
-        icon_url=author.get("profilePicture"),
-        url=tweet.get("twitterUrl") or tweet.get("url"),
+        name=f"{author.get('name', 'Unknown')} (@{username})",
+        icon_url=author.get("profile_image_url"),
+        url=tweet_url,
     )
     if labels:
         embed.title = labels
@@ -78,13 +112,6 @@ class TwitterMonitorBot(discord.Client):
         )
         self.tree.add_command(search_cmd)
 
-        addtolist_cmd = discord.app_commands.Command(
-            name="addtolist",
-            description="Add one or more comma-separated handles to the monitored X List",
-            callback=self._addtolist_callback,
-        )
-        self.tree.add_command(addtolist_cmd)
-
         try:
             synced = await self.tree.sync()
             log.info("Synced %d slash commands", len(synced))
@@ -99,44 +126,40 @@ class TwitterMonitorBot(discord.Client):
 
     async def _recenttweets_callback(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        import requests
-
-        url = "https://api.twitterapi.io/twitter/list/tweets"
-        headers = {"X-API-Key": TWITTERAPI_KEY}
-        params = {"listId": LIST_ID}
-
         try:
-            resp = await asyncio.to_thread(requests.get, url, headers=headers, params=params, timeout=15)
-            data = resp.json()
+            payload = await asyncio.to_thread(_fetch_list_tweets, LIST_ID, 20)
         except Exception as e:
             await interaction.followup.send(f"Request failed: {e}")
             return
 
-        tweets = data.get("tweets", [])
-        if not tweets:
-            await interaction.followup.send(f"Status {resp.status_code}, but no tweets in response:\n```{resp.text[:1500]}```")
+        if "errors" in payload and not payload.get("data"):
+            await interaction.followup.send(f"X API returned an error:\n```{payload['errors']}```")
             return
 
-        await interaction.followup.send(f"Showing the {min(3, len(tweets))} most recent tweets from your list, in the actual clean format:")
+        tweets = payload.get("data", [])
+        if not tweets:
+            await interaction.followup.send("No tweets in response from the list.")
+            return
+
+        users_by_id = _index_users(payload)
+        await interaction.followup.send(f"Showing the {min(3, len(tweets))} most recent tweets from your list:")
         for tweet in tweets[:3]:
-            await interaction.channel.send(embed=build_tweet_embed(tweet))
+            await interaction.channel.send(embed=build_tweet_embed(tweet, users_by_id))
 
     async def _search_callback(self, interaction: discord.Interaction, term: str):
         await interaction.response.defer()
-        import requests
-
-        url = "https://api.twitterapi.io/twitter/list/tweets"
-        headers = {"X-API-Key": TWITTERAPI_KEY}
-        params = {"listId": LIST_ID}
-
         try:
-            resp = await asyncio.to_thread(requests.get, url, headers=headers, params=params, timeout=15)
-            data = resp.json()
+            payload = await asyncio.to_thread(_fetch_list_tweets, LIST_ID, 100)
         except Exception as e:
             await interaction.followup.send(f"Request failed: {e}")
             return
 
-        tweets = data.get("tweets", [])
+        if "errors" in payload and not payload.get("data"):
+            await interaction.followup.send(f"X API returned an error:\n```{payload['errors']}```")
+            return
+
+        tweets = payload.get("data", [])
+        users_by_id = _index_users(payload)
         term_lower = term.lower()
         matches = [t for t in tweets if term_lower in t.get("text", "").lower()]
 
@@ -146,31 +169,7 @@ class TwitterMonitorBot(discord.Client):
 
         await interaction.followup.send(f"Found {len(matches)} recent tweet(s) mentioning '{term}':")
         for tweet in matches[:5]:
-            await interaction.channel.send(embed=build_tweet_embed(tweet))
-
-    async def _addtolist_callback(self, interaction: discord.Interaction, handles: str):
-        await interaction.response.defer()
-        import requests
-
-        usernames = [h.strip().lstrip("@") for h in handles.split(",") if h.strip()]
-        url = "https://api.twitterapi.io/twitter/list/add_member"
-        headers = {"X-API-Key": TWITTERAPI_KEY}
-
-        results = []
-        for username in usernames:
-            try:
-                resp = await asyncio.to_thread(
-                    requests.post, url, headers=headers,
-                    json={"listId": LIST_ID, "userName": username}, timeout=15,
-                )
-                if resp.status_code == 200:
-                    results.append(f"✅ @{username}")
-                else:
-                    results.append(f"❌ @{username} — status {resp.status_code}: {resp.text[:150]}")
-            except Exception as e:
-                results.append(f"❌ @{username} — {e}")
-
-        await interaction.followup.send("\n".join(results)[:2000])
+            await interaction.channel.send(embed=build_tweet_embed(tweet, users_by_id))
 
     async def on_ready(self):
         log.info("Logged in as %s", self.user)
@@ -196,8 +195,6 @@ async def poll_list_tweets(bot: TwitterMonitorBot):
 
 
 async def _poll_list_tweets_body(bot: TwitterMonitorBot):
-    import requests
-
     channel_id = storage.get_config("announce_channel_id")
     if not channel_id:
         return
@@ -205,18 +202,19 @@ async def _poll_list_tweets_body(bot: TwitterMonitorBot):
     if channel is None:
         return
 
-    url = "https://api.twitterapi.io/twitter/list/tweets"
-    headers = {"X-API-Key": TWITTERAPI_KEY}
-    params = {"listId": LIST_ID}
-
     try:
-        resp = await asyncio.to_thread(requests.get, url, headers=headers, params=params, timeout=15)
-        data = resp.json()
+        payload = await asyncio.to_thread(_fetch_list_tweets, LIST_ID, 20)
     except Exception as e:
         log.error("Failed to fetch list tweets: %s", e)
         return
 
-    tweets = data.get("tweets", [])
+    if "errors" in payload and not payload.get("data"):
+        log.error("X API returned errors: %s", payload["errors"])
+        return
+
+    tweets = payload.get("data", [])
+    users_by_id = _index_users(payload)
+
     # Process oldest-first so if multiple new tweets arrived since last
     # check, they post to Discord in chronological order.
     for tweet in reversed(tweets):
@@ -233,7 +231,7 @@ async def _poll_list_tweets_body(bot: TwitterMonitorBot):
             continue  # not betting-relevant, skip silently
 
         try:
-            await channel.send(embed=build_tweet_embed(tweet, matches))
+            await channel.send(embed=build_tweet_embed(tweet, users_by_id, matches))
             log.info("Posted tweet %s (categories: %s)", tweet_id, [m["key"] for m in matches])
         except Exception as e:
             log.error("Failed to post tweet %s: %s", tweet_id, e)
@@ -261,8 +259,8 @@ async def before_watchdog():
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise SystemExit("Set DISCORD_TOKEN in your .env file.")
-    if not TWITTERAPI_KEY:
-        raise SystemExit("Set TWITTERAPI_KEY in your .env file.")
+    if not X_BEARER_TOKEN:
+        raise SystemExit("Set X_BEARER_TOKEN in your .env file (from developer.x.com, App > Keys and tokens).")
     if not LIST_ID:
         raise SystemExit("Set LIST_ID in your .env file (the X List containing your beat reporters).")
     client.run(DISCORD_TOKEN)
