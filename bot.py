@@ -83,6 +83,18 @@ def build_tweet_embed(tweet: dict, users_by_id: dict, matches: list[dict] = None
     return embed
 
 
+def _group_channel_key(group_key: str) -> str:
+    return f"channel:{group_key}"
+
+
+async def _resolve_channel(bot: discord.Client, config_key: str):
+    """Returns the Discord channel for a stored config key, or None."""
+    channel_id = storage.get_config(config_key)
+    if not channel_id:
+        return None
+    return bot.get_channel(int(channel_id))
+
+
 class TwitterMonitorBot(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
@@ -93,10 +105,35 @@ class TwitterMonitorBot(discord.Client):
 
         setchannel_cmd = discord.app_commands.Command(
             name="setchannel",
-            description="Set this channel to receive beat reporter alerts",
+            description="Set this channel to receive general beat reporter alerts",
             callback=self._setchannel_callback,
         )
         self.tree.add_command(setchannel_cmd)
+
+        # Group choices generated straight from keywords.GROUPS so adding a
+        # new group in keywords.py automatically shows up here.
+        group_choices = [
+            discord.app_commands.Choice(name=grp["label"], value=key)
+            for key, grp in keywords.GROUPS.items()
+        ]
+
+        @discord.app_commands.choices(group=group_choices)
+        async def _setgroupchannel_callback(
+            interaction: discord.Interaction,
+            group: discord.app_commands.Choice[str],
+        ):
+            storage.set_config(_group_channel_key(group.value), str(interaction.channel_id))
+            grp = keywords.GROUPS[group.value]
+            await interaction.response.send_message(
+                f"✅ {grp['emoji']} **{grp['label']}** alerts will post in {interaction.channel.mention}."
+            )
+
+        setgroupchannel_cmd = discord.app_commands.Command(
+            name="setgroupchannel",
+            description="Set this channel to receive alerts for a specific keyword group",
+            callback=_setgroupchannel_callback,
+        )
+        self.tree.add_command(setgroupchannel_cmd)
 
         recenttweets_cmd = discord.app_commands.Command(
             name="recenttweets",
@@ -121,7 +158,7 @@ class TwitterMonitorBot(discord.Client):
     async def _setchannel_callback(self, interaction: discord.Interaction):
         storage.set_config("announce_channel_id", str(interaction.channel_id))
         await interaction.response.send_message(
-            f"✅ Beat reporter alerts will post in {interaction.channel.mention}."
+            f"✅ General beat reporter alerts will post in {interaction.channel.mention}."
         )
 
     async def _recenttweets_callback(self, interaction: discord.Interaction):
@@ -195,13 +232,6 @@ async def poll_list_tweets(bot: TwitterMonitorBot):
 
 
 async def _poll_list_tweets_body(bot: TwitterMonitorBot):
-    channel_id = storage.get_config("announce_channel_id")
-    if not channel_id:
-        return
-    channel = bot.get_channel(int(channel_id))
-    if channel is None:
-        return
-
     try:
         payload = await asyncio.to_thread(_fetch_list_tweets, LIST_ID, 20)
     except Exception as e:
@@ -225,14 +255,57 @@ async def _poll_list_tweets_body(bot: TwitterMonitorBot):
         if storage.already_posted(tweet_id):
             continue
 
-        matches = keywords.classify_tweet(text)
+        author = users_by_id.get(tweet.get("author_id"), {})
+        username = author.get("username", "")
+
         storage.mark_posted(tweet_id)  # mark seen regardless of match, so we never re-check it
+
+        # --- Routing ---
+        # 1) Account override: every post from this account goes to its
+        #    mapped group's channel, no keyword match required.
+        override_group = keywords.account_override_group(username)
+        if override_group:
+            grp = keywords.GROUPS[override_group]
+            channel = await _resolve_channel(bot, _group_channel_key(override_group))
+            if channel is None:
+                log.warning("No channel set for group '%s' (needed for @%s override) -- run /setgroupchannel", override_group, username)
+                continue
+            try:
+                await channel.send(embed=build_tweet_embed(
+                    tweet, users_by_id,
+                    [{"key": override_group, "emoji": grp["emoji"], "label": grp["label"]}],
+                ))
+                log.info("Posted tweet %s to group '%s' (account override @%s)", tweet_id, override_group, username)
+            except Exception as e:
+                log.error("Failed to post tweet %s: %s", tweet_id, e)
+            continue
+
+        # 2) Group keyword match: route to each matched group's channel.
+        group_matches = keywords.classify_groups(text)
+        if group_matches:
+            for gm in group_matches:
+                channel = await _resolve_channel(bot, _group_channel_key(gm["key"]))
+                if channel is None:
+                    log.warning("No channel set for group '%s' -- run /setgroupchannel in the target channel", gm["key"])
+                    continue
+                try:
+                    await channel.send(embed=build_tweet_embed(tweet, users_by_id, [gm]))
+                    log.info("Posted tweet %s to group '%s'", tweet_id, gm["key"])
+                except Exception as e:
+                    log.error("Failed to post tweet %s to group '%s': %s", tweet_id, gm["key"], e)
+            continue
+
+        # 3) General categories fallback: post to the general channel.
+        matches = keywords.classify_tweet(text)
         if not matches:
             continue  # not betting-relevant, skip silently
 
+        channel = await _resolve_channel(bot, "announce_channel_id")
+        if channel is None:
+            continue
         try:
             await channel.send(embed=build_tweet_embed(tweet, users_by_id, matches))
-            log.info("Posted tweet %s (categories: %s)", tweet_id, [m["key"] for m in matches])
+            log.info("Posted tweet %s to general (categories: %s)", tweet_id, [m["key"] for m in matches])
         except Exception as e:
             log.error("Failed to post tweet %s: %s", tweet_id, e)
 
