@@ -226,12 +226,30 @@ def _add_rules(rules: list[dict]):
         raise RuntimeError(f"Some rules were rejected: {errors}")
 
 
-def sync_stream_rules() -> tuple[int, int]:
-    """Replaces the app's stream rules with a fresh build from the list's
-    current members. Returns (num_handles, num_rules)."""
-    handles = _fetch_list_member_usernames(LIST_ID)
+def sync_stream_rules(force_refresh: bool = False) -> tuple[int, int]:
+    """Replaces the app's stream rules. Handles come from a DB cache when
+    available -- fetching the list's members is the ONLY billed part of a
+    sync (~1 cent per member), so normal restarts/redeploys rebuild rules
+    from cache for free. force_refresh=True (the /syncrules command)
+    re-fetches from X and updates the cache -- the one moment paying is
+    correct, because the list actually changed. Returns (handles, rules)."""
+    handles: list[str] = []
+    if not force_refresh:
+        cached = storage.get_config("cached_list_handles")
+        if cached:
+            try:
+                handles = json.loads(cached)
+            except json.JSONDecodeError:
+                handles = []
     if not handles:
-        raise RuntimeError("List returned no members -- check LIST_ID / token access.")
+        handles = _fetch_list_member_usernames(LIST_ID)
+        if not handles:
+            raise RuntimeError("List returned no members -- check LIST_ID / token access.")
+        storage.set_config("cached_list_handles", json.dumps(handles))
+        log.info("Fetched %d list members from X (billed lookup) and cached them", len(handles))
+    else:
+        log.info("Using %d cached list members (no billed lookup)", len(handles))
+
     rules = build_stream_rules(handles)
 
     existing = _get_existing_rules()
@@ -492,12 +510,12 @@ class TwitterMonitorBot(discord.Client):
             return
         await interaction.response.defer()
         try:
-            num_handles, num_rules = await asyncio.to_thread(sync_stream_rules)
+            num_handles, num_rules = await asyncio.to_thread(sync_stream_rules, True)
         except Exception as e:
             await interaction.followup.send(f"Rule sync failed: {e}")
             return
         await interaction.followup.send(
-            f"✅ Stream rules rebuilt: **{num_handles}** writers -> **{num_rules}** rules."
+            f"✅ Stream rules rebuilt from a fresh list fetch: **{num_handles}** writers -> **{num_rules}** rules."
         )
 
     async def _streamstatus_callback(self, interaction: discord.Interaction):
