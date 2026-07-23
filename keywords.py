@@ -1,51 +1,57 @@
 """
-Classifies beat reporter tweets into betting-relevant categories based on
-keyword matching, and routes them to per-group Discord channels.
-
-Two layers:
-1. GROUPS  -- specific high-signal bundles, each with its own channel
-              (set via /setgroupchannel in Discord). Checked first.
-2. CATEGORIES -- the original general-info buckets. Anything that matches
-              only these goes to the general channel (/setchannel).
+Classifies beat reporter tweets and routes them to per-group Discord
+channels. July 22 redesign: FOUR group channels, no general catch-all --
+the old general categories (IL/roster/lineup) were removed entirely per
+the Discord restructure. A tweet matching none of the groups never posts
+(and on the filtered stream, never gets delivered or billed).
 
 ACCOUNT_OVERRIDES -- accounts whose EVERY post routes to a group's channel,
-              no keyword match required (e.g. @MLBInjuryBot -> injury).
+no keyword match required (e.g. @MLBInjuryBot -> injury).
 """
 
-# ---------------------------------------------------------------------------
-# Per-channel keyword groups (checked first). Key = group name used by
-# /setgroupchannel. Keyword matching is simple case-insensitive substring
-# against the padded lowercase tweet text.
-# ---------------------------------------------------------------------------
 GROUPS = {
     "live_action": {
         "emoji": "\u26a1",
         "label": "Live Action",
         "keywords": [
-            "warming up", "getting loose", "on deck", "pinch hit", "pinch-hit",
-            "velocity down", "velo down", "stretching",
+            "warming up", "getting loose", "on deck",
+            "pinch hit", "pinch hitter", "pinch-hit", "pinch-hitter",
+            "stretching", "bullpen",
         ],
     },
     "injury": {
         "emoji": "\U0001f691",
         "label": "Injury Watch",
         "keywords": [
-            "trainer visit", "hurt", "injured", "grabbing at", "favoring",
-            "limping", "shaking his arm", "wincing",
-            "removed with an apparent injury", "exited with injury",
-            "not right", "medical staff", "training staff",
+            "trainer visit", "favoring", "limping",
+            "grimace", "grimacing", "not right", "medical staff",
+            "down tunnel", "down the tunnel",
+            "down clubhouse", "down the clubhouse",
+            "down stairs", "down the stairs",
         ],
     },
     "scratched": {
         "emoji": "\U0001f500",
         "label": "Starter Scratched",
         "keywords": [
-            "scratched", "pushed back", "bumped back", "shifted back",
-            "moved back in the rotation", "skipping his turn", "skip his turn",
-            "no longer starting", "will not make his scheduled start",
-            "rotation swap", "swapped rotation spots",
-            "start has been moved to", "will now start on",
-            "placed on extra rest",
+            "scratched", "pushed back", "bumped back",
+            "rotation change", "rotation shifted", "rotation swap",
+            "skipping turn", "skipping his turn", "skip his turn",
+            "will not make start", "will not make his start",
+            "scheduled start", "no longer starting",
+            "start moved", "start has been moved", "will now start on",
+            "extra rest",
+        ],
+    },
+    "limit": {
+        "emoji": "\u26be",
+        "label": "Limit",
+        "keywords": [
+            "pitch count", "pitch limit", "innings limit", "on a limit",
+            "workload",
+            "manage innings", "manage his innings", "managing his innings",
+            "innings management",
+            "piggyback", "piggy back",
         ],
     },
 }
@@ -56,62 +62,10 @@ ACCOUNT_OVERRIDES = {
     "mlbinjurybot": "injury",
 }
 
-# ---------------------------------------------------------------------------
-# Original general-info categories. A tweet matching ONLY these (no group
-# match) posts to the general channel set via /setchannel.
-# ---------------------------------------------------------------------------
-CATEGORIES = {
-    "injury": {
-        "emoji": "\U0001f691",
-        "label": "Injury/IL",
-        "keywords": [
-            "injured list", " il ", "il with", "placed on the il", "activated from",
-            "mri", "surgery", "hamstring", "oblique", "elbow", "shoulder", "forearm",
-            "day-to-day", "day to day", "scratched", "left the game", "exited the game",
-            "tightness", "soreness", "strain", "sprain", "tommy john",
-            "injury", "injured",
-        ],
-    },
-    "pitch_limit": {
-        "emoji": "\u26be",
-        "label": "Pitch Count/Limit",
-        "keywords": [
-            "pitch count", "pitch limit", "innings limit", "on a limit",
-            "shut down", "shut it down", "will not pitch", "skipping his start",
-            "pushed back", "extra rest", "limited to",
-            "workload", "won't start", "will not start",
-            "manage innings", "manage his innings", "managing his innings",
-            "innings management", "managing his workload", "monitor his workload",
-            "monitoring his workload",
-        ],
-    },
-    "bullpen": {
-        "emoji": "\U0001f525",
-        "label": "Bullpen",
-        "keywords": [
-            "bullpen", "piggyback", "piggy back",
-        ],
-    },
-    "lineup": {
-        "emoji": "\U0001f4cb",
-        "label": "Lineup Move",
-        "keywords": [
-            "starting lineup", "batting order", "out of the lineup", "day off",
-            "leadoff", "batting cleanup", "will start tonight", "starting tonight",
-            "not in the lineup", "getting the night off", "sitting tonight",
-            "on deck", "pinch hit", "pinch-hit",
-        ],
-    },
-    "roster": {
-        "emoji": "\U0001f504",
-        "label": "Roster Move",
-        "keywords": [
-            "recalled", "optioned", "designated for assignment", " dfa'd", " dfa ",
-            "called up", "selected his contract", "outrighted", "claimed off waivers",
-            "released", "signed a", "trade", "traded",
-        ],
-    },
-}
+# July 22 redesign: general categories removed -- everything routes via
+# GROUPS above. Kept as an empty dict so bot.py's general-category code
+# path stays valid and simply never matches.
+CATEGORIES = {}
 
 
 def _pad(text: str) -> str:
@@ -136,7 +90,8 @@ def classify_groups(text: str) -> list[dict]:
 
 
 def classify_tweet(text: str) -> list[dict]:
-    """Original general-category classifier. Returns matched category dicts."""
+    """General-category classifier -- categories were removed in the July 22
+    redesign, so this always returns []. Kept for bot.py compatibility."""
     text_lower = _pad(text)
     matches = []
     for key, cat in CATEGORIES.items():
