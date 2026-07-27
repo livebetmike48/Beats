@@ -25,6 +25,17 @@ New pieces:
   pay-per-use, but the definitive source is this account's own access),
   the bot LOGS IT LOUDLY and automatically falls back to the old 90s
   polling loop, so worst case is today's behavior/cost, never silence.
+
+July 27 additions:
+- Keywords now live in the DB (seeded once from keywords.DEFAULT_GROUPS)
+  and are editable in Discord: /addword, /removeword, /listwords. Every
+  edit rebuilds the stream rules immediately, because a keyword that
+  isn't in a rule is dead -- X only delivers what a rule matches. The
+  rebuild is FREE: it reuses the cached writer handles, so no member
+  lookups are billed. Only /syncrules re-fetches the list.
+- Rule replacement is now restore-on-failure: rules are built before the
+  old ones are deleted, and if the add half fails the previous rules are
+  pushed back rather than leaving the stream with zero rules.
 """
 import os
 import json
@@ -52,8 +63,13 @@ STREAM_URL = f"{X_API_BASE}/tweets/search/stream"
 RULES_URL = f"{X_API_BASE}/tweets/search/stream/rules"
 
 MAX_RULE_LEN = 1024        # documented per-rule character cap
+MAX_RULES = 1000           # documented per-app rule cap
 KW_CHUNK_BUDGET = 380      # chars of keyword clause per rule
 AUTHOR_CHUNK_BUDGET = 560  # chars of author clause per rule
+
+# Characters that would break X rule syntax if they landed inside a keyword.
+BAD_PHRASE_CHARS = '"()'
+MAX_PHRASE_LEN = 60
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("twitter_bot")
@@ -176,13 +192,11 @@ def _chunk_terms(terms: list[str], budget: int, joiner: str = " OR ") -> list[st
 def build_stream_rules(handles: list[str]) -> list[dict]:
     """Author chunks x keyword chunks, each combined rule <= 1024 chars,
     plus one rule per account-override (all posts from that account).
-    Retweets excluded everywhere -- no paying for RTs of news."""
-    all_keywords = set()
-    for grp in keywords.GROUPS.values():
-        all_keywords.update(grp["keywords"])
-    for cat in keywords.CATEGORIES.values():
-        all_keywords.update(cat["keywords"])
-    kw_terms = sorted({_format_keyword(k) for k in all_keywords if k.strip()})
+    Retweets excluded everywhere -- no paying for RTs of news.
+
+    Reads the LIVE keyword state (keywords.GROUPS), which bot.py loads from
+    the DB, so /addword and /removeword feed straight into this."""
+    kw_terms = sorted({_format_keyword(k) for k in keywords.all_keywords()})
 
     override_handles = {h.lower() for h in keywords.ACCOUNT_OVERRIDES}
     author_terms = [f"from:{h}" for h in handles if h.lower() not in override_handles]
@@ -226,6 +240,43 @@ def _add_rules(rules: list[dict]):
         raise RuntimeError(f"Some rules were rejected: {errors}")
 
 
+def _replace_rules(rules: list[dict]) -> int:
+    """Delete-then-add, with restore on failure. build_stream_rules() is
+    always called BEFORE this, so a malformed keyword raises while the old
+    rules are still live. If the add half fails after the delete, the
+    previous rules are pushed back rather than leaving the stream with zero
+    rules (= silence, the one outcome worse than cost)."""
+    if len(rules) > MAX_RULES:
+        raise ValueError(f"{len(rules)} rules would exceed the {MAX_RULES}-rule cap")
+    existing = _get_existing_rules()
+    _delete_rules([r["id"] for r in existing])
+    try:
+        _add_rules(rules)
+    except Exception:
+        restore = [{"value": r["value"], "tag": r["tag"]}
+                   for r in existing if r.get("value") and r.get("tag")]
+        if restore:
+            try:
+                _add_rules(restore)
+                log.error("Rule add FAILED -- previous %d rules restored, stream still delivering.", len(restore))
+            except Exception as e2:
+                log.critical("Rule add failed AND restore failed (%s) -- the app has NO stream rules. "
+                             "Run /syncrules as soon as possible.", e2)
+        raise
+    _stream_state["rule_count"] = len(rules)
+    return len(rules)
+
+
+def _cached_handles() -> list[str]:
+    cached = storage.get_config("cached_list_handles")
+    if not cached:
+        return []
+    try:
+        return json.loads(cached)
+    except json.JSONDecodeError:
+        return []
+
+
 def sync_stream_rules(force_refresh: bool = False) -> tuple[int, int]:
     """Replaces the app's stream rules. Handles come from a DB cache when
     available -- fetching the list's members is the ONLY billed part of a
@@ -233,14 +284,7 @@ def sync_stream_rules(force_refresh: bool = False) -> tuple[int, int]:
     from cache for free. force_refresh=True (the /syncrules command)
     re-fetches from X and updates the cache -- the one moment paying is
     correct, because the list actually changed. Returns (handles, rules)."""
-    handles: list[str] = []
-    if not force_refresh:
-        cached = storage.get_config("cached_list_handles")
-        if cached:
-            try:
-                handles = json.loads(cached)
-            except json.JSONDecodeError:
-                handles = []
+    handles: list[str] = [] if force_refresh else _cached_handles()
     if not handles:
         handles = _fetch_list_member_usernames(LIST_ID)
         if not handles:
@@ -251,13 +295,51 @@ def sync_stream_rules(force_refresh: bool = False) -> tuple[int, int]:
         log.info("Using %d cached list members (no billed lookup)", len(handles))
 
     rules = build_stream_rules(handles)
-
-    existing = _get_existing_rules()
-    _delete_rules([r["id"] for r in existing])
-    _add_rules(rules)
-    _stream_state["rule_count"] = len(rules)
+    _replace_rules(rules)
     log.info("Stream rules synced: %d handles -> %d rules", len(handles), len(rules))
     return len(handles), len(rules)
+
+
+def rebuild_rules_from_cache() -> int:
+    """Rebuild + push rules using the cached handles ONLY. This is what a
+    keyword edit calls: zero billed calls (the rules API itself is free),
+    and it refuses rather than quietly triggering a ~$1.86 member fetch if
+    the cache is empty. Returns the new rule count."""
+    handles = _cached_handles()
+    if not handles:
+        raise RuntimeError(
+            "No cached writer handles yet -- run /syncrules once first "
+            "(that's the billed call), then keyword edits are free."
+        )
+    return _replace_rules(build_stream_rules(handles))
+
+
+def _clean_phrase(raw: str) -> tuple[bool, str, str]:
+    """Normalize a user-typed keyword. Returns (ok, cleaned, error)."""
+    p = " ".join((raw or "").strip().lower().split())
+    if len(p) < 2:
+        return False, p, "Keyword must be at least 2 characters."
+    if len(p) > MAX_PHRASE_LEN:
+        return False, p, f"Keyword too long ({MAX_PHRASE_LEN} character max)."
+    if any(ch in BAD_PHRASE_CHARS for ch in p):
+        return False, p, 'Keyword can\'t contain " ( or ) -- those break X rule syntax.'
+    if ":" in p:
+        return False, p, "Keyword can't contain : -- that's an X query operator."
+    return True, p, ""
+
+
+def _cost_note(phrase: str) -> str | None:
+    """Honest heads-up, not a block. Single words are broader than phrases,
+    and breadth is the only thing that costs money on this plan -- you're
+    billed per tweet X delivers, so a wider keyword = more deliveries."""
+    if " " in phrase:
+        return None
+    note = ("⚠️ Single-word keywords are much broader than phrases, and you're billed per "
+            "delivered tweet — watch tomorrow's dashboard bar.")
+    if keywords.needs_word_boundary(phrase):
+        note += (f"\n`{phrase}` is short enough that Discord routing uses whole-word matching, "
+                 "so it won't fire inside longer words.")
+    return note
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +476,15 @@ class TwitterMonitorBot(discord.Client):
     async def setup_hook(self):
         storage.init_db()
 
+        # Keywords: seed once from the file, then the DB is the source of
+        # truth so Discord edits survive redeploys.
+        seeded = storage.seed_keywords(keywords.DEFAULT_GROUPS)
+        if seeded:
+            log.info("Seeded %d keywords into the DB from keywords.DEFAULT_GROUPS (first boot only)", seeded)
+        keywords.apply_keywords(storage.get_keywords())
+        log.info("Live keywords loaded: %s",
+                 {k: len(g["keywords"]) for k, g in keywords.GROUPS.items()})
+
         setchannel_cmd = discord.app_commands.Command(
             name="setchannel",
             description="Set this channel to receive general beat reporter alerts",
@@ -452,11 +543,153 @@ class TwitterMonitorBot(discord.Client):
         )
         self.tree.add_command(streamstatus_cmd)
 
+        # --- keyword editing -------------------------------------------------
+        @discord.app_commands.choices(group=group_choices)
+        async def _addword_callback(
+            interaction: discord.Interaction,
+            group: discord.app_commands.Choice[str],
+            phrase: str,
+        ):
+            await self._word_change(interaction, "add", group.value, phrase)
+
+        addword_cmd = discord.app_commands.Command(
+            name="addword",
+            description="ADMIN: add a keyword to a group (rebuilds stream rules, free)",
+            callback=_addword_callback,
+        )
+        self.tree.add_command(addword_cmd)
+
+        async def _phrase_autocomplete(interaction: discord.Interaction, current: str):
+            group_val = getattr(interaction.namespace, "group", None)
+            if not group_val:
+                return []
+            words = storage.get_keywords().get(group_val, [])
+            cur = (current or "").lower()
+            return [discord.app_commands.Choice(name=w, value=w)
+                    for w in words if cur in w][:25]
+
+        @discord.app_commands.choices(group=group_choices)
+        @discord.app_commands.autocomplete(phrase=_phrase_autocomplete)
+        async def _removeword_callback(
+            interaction: discord.Interaction,
+            group: discord.app_commands.Choice[str],
+            phrase: str,
+        ):
+            await self._word_change(interaction, "remove", group.value, phrase)
+
+        removeword_cmd = discord.app_commands.Command(
+            name="removeword",
+            description="ADMIN: remove a keyword from a group (rebuilds stream rules, free)",
+            callback=_removeword_callback,
+        )
+        self.tree.add_command(removeword_cmd)
+
+        listwords_choices = [discord.app_commands.Choice(name="All groups", value="__all__")] + group_choices
+
+        @discord.app_commands.choices(group=listwords_choices)
+        async def _listwords_callback(
+            interaction: discord.Interaction,
+            group: discord.app_commands.Choice[str] = None,
+        ):
+            selected = group.value if group else "__all__"
+            live = storage.get_keywords()
+            embed = discord.Embed(
+                title="Beat Reporter keywords",
+                color=discord.Color.blue(),
+            )
+            total = 0
+            for key, grp in keywords.GROUPS.items():
+                words = live.get(key, [])
+                total += len(words)
+                if selected != "__all__" and key != selected:
+                    continue
+                body = ", ".join(f"`{w}`" for w in words) or "_none_"
+                for i in range(0, len(body), 1000):
+                    embed.add_field(
+                        name=f"{grp['emoji']} {grp['label']} ({len(words)})" if i == 0 else "\u200b",
+                        value=body[i:i + 1000],
+                        inline=False,
+                    )
+            embed.set_footer(text=f"{total} keywords live · {_stream_state['rule_count']} stream rules · "
+                                  f"source: database (keywords.py is seed-only after first boot)")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        listwords_cmd = discord.app_commands.Command(
+            name="listwords",
+            description="Show the keywords currently live for each group",
+            callback=_listwords_callback,
+        )
+        self.tree.add_command(listwords_cmd)
+
         try:
             synced = await self.tree.sync()
             log.info("Synced %d slash commands", len(synced))
         except Exception as e:
             log.error("Slash command sync failed: %s", e)
+
+    async def _word_change(self, interaction: discord.Interaction, action: str,
+                           group_key: str, phrase: str):
+        """Shared path for /addword and /removeword: write -> reload -> rebuild
+        rules. If the rebuild fails, the DB write is rolled back so the DB, the
+        in-memory matcher and the live stream rules can never disagree."""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Admin only.", ephemeral=True)
+            return
+
+        ok, cleaned, err = _clean_phrase(phrase)
+        if not ok:
+            await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+            return
+
+        grp = keywords.GROUPS.get(group_key, {})
+        label = f"{grp.get('emoji', '')} **{grp.get('label', group_key)}**".strip()
+
+        await interaction.response.defer(ephemeral=True)
+        before_rules = _stream_state["rule_count"]
+
+        if action == "add":
+            changed = await asyncio.to_thread(storage.add_keyword, group_key, cleaned)
+            if not changed:
+                await interaction.followup.send(f"`{cleaned}` is already in {label}.", ephemeral=True)
+                return
+        else:
+            changed = await asyncio.to_thread(storage.remove_keyword, group_key, cleaned)
+            if not changed:
+                await interaction.followup.send(
+                    f"`{cleaned}` isn't in {label} — check /listwords for the exact wording.",
+                    ephemeral=True)
+                return
+
+        keywords.apply_keywords(await asyncio.to_thread(storage.get_keywords))
+
+        try:
+            after_rules = await asyncio.to_thread(rebuild_rules_from_cache)
+        except Exception as e:
+            # Roll the DB back. The live rules were never replaced (build
+            # raises before the delete) or were restored inside _replace_rules,
+            # so undoing the write puts everything back in agreement.
+            if action == "add":
+                await asyncio.to_thread(storage.remove_keyword, group_key, cleaned)
+            else:
+                await asyncio.to_thread(storage.add_keyword, group_key, cleaned)
+            keywords.apply_keywords(await asyncio.to_thread(storage.get_keywords))
+            log.error("Keyword %s of '%s' rolled back -- rule rebuild failed: %s", action, cleaned, e)
+            await interaction.followup.send(
+                f"❌ Rule rebuild failed, so the change was rolled back — nothing changed.\n`{e}`",
+                ephemeral=True)
+            return
+
+        verb = "Added" if action == "add" else "Removed"
+        prep = "to" if action == "add" else "from"
+        live_count = len(keywords.GROUPS.get(group_key, {}).get("keywords", []))
+        msg = (f"✅ {verb} `{cleaned}` {prep} {label} — {live_count} keywords in that group.\n"
+               f"Stream rules rebuilt: {before_rules} → **{after_rules}** (no billed calls). "
+               f"X applies new rules to the open connection immediately.")
+        if action == "add":
+            note = _cost_note(cleaned)
+            if note:
+                msg += f"\n\n{note}"
+        await interaction.followup.send(msg, ephemeral=True)
 
     async def _setchannel_callback(self, interaction: discord.Interaction):
         storage.set_config("announce_channel_id", str(interaction.channel_id))
@@ -528,8 +761,10 @@ class TwitterMonitorBot(discord.Client):
         last = _stream_state["last_message_at"]
         last_str = last.strftime("%H:%M:%S UTC") if last else "never"
         err = _stream_state.get("last_error") or "none"
+        kw_total = sum(len(g["keywords"]) for g in keywords.GROUPS.values())
         await interaction.response.send_message(
             f"{status}\nRules active: **{_stream_state['rule_count']}**\n"
+            f"Keywords live: **{kw_total}**\n"
             f"Last tweet received: **{last_str}**\nLast error: `{err}`"
         )
 
